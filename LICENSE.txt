@@ -1,0 +1,17 @@
+Academic Non-Commercial License (ANCL)
+
+Copyright (c) 2025 Laboratory of Image and Multimedia Data Science (IMScience)
+
+Permission is hereby granted to any individual or institution, free of charge, to use, copy, modify, and distribute this software and associated documentation files (the “Software”), in source code or compiled form, subject to the following conditions:
+
+Academic and Research Use Only
+The Software may be used solely for non-commercial purposes, including but not limited to: academic research, classroom teaching, and personal study.
+
+Prohibition of Commercial Use
+Commercial use of the Software, in whole or in part, is strictly prohibited. Commercial use includes, but is not limited to: incorporating the Software into a product for sale, using it to provide a commercial service, or redistributing it under a commercial license.
+
+Redistribution
+Redistributions of the Software, in source or binary form, must retain this license, the copyright notice, and the disclaimer of warranty.
+
+Disclaimer of Warranty and Liability
+The Software is provided by the authors “as is”, without any express or implied warranties, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose. In no event shall the authors be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption), however caused and on any theory of liability, whether in contract, strict liability, or tort (including negligence or otherwise), arising in any way out of the use of this Software, even if advised of the possibility of such damage.
