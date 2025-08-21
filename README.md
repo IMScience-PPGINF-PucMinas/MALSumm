@@ -1,4 +1,4 @@
-# Streamlined Extended Long Short-Term Memory for Video Skimming
+# Memory-Augmented Long Short-Term Memory for Dynamic Video Summarization
 PyTorch code for our Sibgrapi 2025 paper "Memory-Augmented Long Short-Term Memory for Dynamic Video Summarization" Enhanced
 by [Leonardo Vilela Cardoso](http://lattes.cnpq.br/6741312586742178), [Barbara Hellen P. Soraggi](http://lattes.cnpq.br/9625828407766581), [Silvio Jamil F. Guimarães](http://lattes.cnpq.br/8522089151904453) and 
 [Zenilton K. G. Patrocínio Jr](http://lattes.cnpq.br/8895634496108399), 
