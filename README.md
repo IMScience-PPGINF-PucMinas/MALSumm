@@ -86,3 +86,7 @@ If you find this code useful for your research, consider cite our paper:
 }
 
 ```
+
+## Others
+This code used resources from the following projects for the evaluation process: 
+[PGL-Sum](https://github.com/e-apostolidis/PGL-SUM/)
