@@ -48,7 +48,6 @@ matplotlib.use('Agg')                       # headless — no display needed
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from matplotlib.patches import Patch
-from scipy.ndimage import uniform_filter1d  # lightweight smoothing for GT
 
 from utils.utils import get_paths
 from model.layers.summarizer import xLSTM
@@ -69,61 +68,80 @@ PALETTE = {
 
 
 # ---------------------------------------------------------------------------
-# Score pipeline helpers
+# Score pipeline helpers — segment (shot) level
 # ---------------------------------------------------------------------------
 
-def _upsample_scores(scores, positions, n_frames):
-    """Expand sub-sampled scores to full-resolution frame scores.
+def _compute_shot_signals(scores, positions, n_frames, shot_bound, user_summary):
+    """Compute all three signals at shot (segment) level.
 
-    Mirrors the logic in generate_summary.py so the raw score line aligns
-    exactly with the knapsack and GT signals.
+    O eixo X do gráfico representa segmentos (shots), não frames individuais.
+    Isso alinha diretamente com a unidade de decisão do knapsack e torna
+    visível quais segmentos foram selecionados versus seus scores originais.
+
+    Parameters
+    ----------
+    scores       : list[float]  scores subamostrados do modelo (len = n_picks)
+    positions    : ndarray      índices de frames subamostrados (picks)
+    n_frames     : int          total de frames do vídeo original
+    shot_bound   : ndarray      [n_shots, 2] boundaries de cada shot
+    user_summary : ndarray      [n_annotators, n_frames] ou [n_frames]
+
+    Returns
+    -------
+    shot_model_scores : ndarray [n_shots]  score médio do modelo por shot
+                        (normalizado min-max — mesmo valor que entra no knapsack)
+    knapsack_selected : ndarray [n_shots]  1 = selecionado pelo knapsack, 0 = não
+    shot_gt_scores    : ndarray [n_shots]  importância média do GT por shot
+    shot_lengths      : list[int]          comprimento em frames de cada shot
+    selected_indices  : list[int]          índices dos shots selecionados
     """
+    # 1. Upsample scores subamostrados → todos os frames
     frame_scores = np.zeros(n_frames, dtype=np.float32)
     pos = positions.astype(np.int32)
     if pos[-1] != n_frames:
         pos = np.concatenate([pos, [n_frames]])
     for i in range(len(pos) - 1):
-        val = scores[i] if i < len(scores) else 0.0
-        frame_scores[pos[i]:pos[i + 1]] = val
-    return frame_scores
+        frame_scores[pos[i]:pos[i + 1]] = scores[i] if i < len(scores) else 0.0
 
+    # 2. Normalização min-max (igual ao generate_summary.py atualizado)
+    s_min, s_max = frame_scores.min(), frame_scores.max()
+    denom = s_max - s_min
+    if denom > 1e-8:
+        frame_scores = (frame_scores - s_min) / denom
 
-def _compute_knapsack_scores(frame_scores, shot_bound):
-    """Reproduce the shot-level importance + knapsack selection.
+    # 3. Score médio do modelo por shot (valor que o knapsack recebe)
+    shot_model_scores = np.array([
+        float(frame_scores[s[0]:s[1] + 1].mean())
+        for s in shot_bound
+    ], dtype=np.float32)
 
-    Returns
-    -------
-    knapsack_mask : np.ndarray [n_frames] binary, 1 = selected
-    shot_scores   : list of float, one per shot (for optional annotation)
-    """
-    shot_imp_scores, shot_lengths = [], []
-    for shot in shot_bound:
-        shot_lengths.append(int(shot[1] - shot[0] + 1))
-        shot_imp_scores.append(float(frame_scores[shot[0]:shot[1] + 1].mean()))
+    shot_lengths = [int(s[1] - s[0] + 1) for s in shot_bound]
 
+    # 4. Knapsack: seleciona shots que maximizam score dentro de 15% do vídeo
     final_max_length = int((shot_bound[-1][1] + 1) * 0.15)
-    selected = knapSack(
-        final_max_length, shot_lengths, shot_imp_scores, len(shot_lengths)
+    selected_indices = knapSack(
+        final_max_length, shot_lengths,
+        shot_model_scores.tolist(), len(shot_lengths)
     )
 
-    mask = np.zeros(shot_bound[-1][1] + 1, dtype=np.int8)
-    for idx in selected:
-        mask[shot_bound[idx][0]:shot_bound[idx][1] + 1] = 1
+    knapsack_selected = np.zeros(len(shot_bound), dtype=np.float32)
+    for idx in selected_indices:
+        knapsack_selected[idx] = 1.0
 
-    return mask, shot_imp_scores
+    # 5. GT médio por shot — média dos anotadores, depois média por shot
+    gt_frame = np.atleast_2d(user_summary).mean(axis=0).astype(np.float32)
+    shot_gt_scores = np.array([
+        float(gt_frame[s[0]:min(s[1] + 1, len(gt_frame))].mean())
+        for s in shot_bound
+    ], dtype=np.float32)
 
+    # Normaliza GT para [0,1] para facilitar comparação visual
+    gt_min, gt_max = shot_gt_scores.min(), shot_gt_scores.max()
+    if gt_max - gt_min > 1e-8:
+        shot_gt_scores = (shot_gt_scores - gt_min) / (gt_max - gt_min)
 
-def _mean_gt(user_summary):
-    """Return per-frame mean importance across all annotators.
-
-    user_summary shape: [n_annotators, n_frames] or [n_frames].
-    Smoothed with a small uniform filter so the reference curve is
-    readable even when individual annotations are very sparse/binary.
-    """
-    gt = np.atleast_2d(user_summary).mean(axis=0).astype(np.float32)
-    # Smooth over ~2% of video length, minimum 5 frames
-    window = max(5, int(len(gt) * 0.02))
-    return uniform_filter1d(gt, size=window)
+    return (shot_model_scores, knapsack_selected,
+            shot_gt_scores, shot_lengths, selected_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -138,84 +156,106 @@ def _sanitise_filename(name):
     return name or 'video'
 
 
-def plot_video(video_id, raw_scores, knapsack_mask, gt_mean,
+def plot_video(video_id, shot_model_scores, knapsack_selected,
+               shot_gt_scores, shot_lengths, selected_indices,
                shot_bound, video_name, dataset, output_dir, f_score=None):
-    """Render and save one chart for a single video.
+    """Render and save one chart for a single video at segment (shot) level.
+
+    O eixo X representa segmentos (shots), não frames individuais.
+    Cada ponto no eixo X corresponde a um shot, e sua largura visual é
+    proporcional ao comprimento do shot em frames — dando uma representação
+    temporal fiel mesmo no espaço de segmentos.
 
     Parameters
     ----------
-    video_id      : str   h5 key, e.g. 'video_1'
-    raw_scores    : ndarray [n_frames]  model scores 0-1
-    knapsack_mask : ndarray [n_frames]  binary selection
-    gt_mean       : ndarray [n_frames]  smoothed GT mean
-    shot_bound    : ndarray [n_shots,2] shot boundaries
-    video_name    : str   human-readable name (used as title + filename)
-    dataset       : str   'SumMe' | 'TVSum' | …
-    output_dir    : str   root output directory
-    f_score       : float optional — shown in title if provided
+    video_id          : str      h5 key, e.g. 'video_1'
+    shot_model_scores : ndarray  [n_shots] score médio normalizado por shot
+    knapsack_selected : ndarray  [n_shots] 1=selecionado, 0=não (float)
+    shot_gt_scores    : ndarray  [n_shots] GT médio normalizado por shot
+    shot_lengths      : list     comprimento em frames de cada shot
+    selected_indices  : list     índices dos shots selecionados
+    shot_bound        : ndarray  [n_shots, 2] para referência
+    video_name        : str
+    dataset           : str
+    output_dir        : str
+    f_score           : float opcional
     """
-    n_frames = len(raw_scores)
-    x        = np.arange(n_frames)
+    n_shots      = len(shot_model_scores)
+    total_frames = sum(shot_lengths)
+
+    # Posição central de cada shot em frames (eixo X proporcional ao tempo)
+    # Cada shot ocupa uma faixa proporcional ao seu comprimento
+    shot_starts  = np.array([shot_bound[i][0] for i in range(n_shots)], dtype=float)
+    shot_ends    = np.array([shot_bound[i][1] + 1 for i in range(n_shots)], dtype=float)
+    shot_centers = (shot_starts + shot_ends) / 2.0
 
     # ---- figure layout ----
     fig, ax = plt.subplots(figsize=(14, 4.5), dpi=130)
     fig.patch.set_facecolor('#FAFAFA')
     ax.set_facecolor('#F5F5F5')
 
-    # ---- shot boundary vertical lines ----
-    for shot in shot_bound:
-        for edge in (shot[0], shot[1]):
-            ax.axvline(edge, color=PALETTE['shot_edge'],
-                       linewidth=0.4, zorder=1, alpha=0.6)
+    # ---- fundo: regiões selecionadas pelo knapsack ----
+    # Destacadas como faixas verticais proporcionais ao comprimento do shot
+    for idx in selected_indices:
+        ax.axvspan(shot_starts[idx], shot_ends[idx],
+                   facecolor=PALETTE['bg_select'],
+                   alpha=0.50, zorder=1, linewidth=0)
 
-    # ---- knapsack selected regions (filled background) ----
-    in_region  = False
-    region_start = 0
-    extended = np.append(knapsack_mask, 0)      # sentinel to close last region
-    for i, val in enumerate(extended):
-        if val == 1 and not in_region:
-            region_start = i
-            in_region    = True
-        elif val == 0 and in_region:
-            ax.axvspan(region_start, i,
-                       facecolor=PALETTE['bg_select'],
-                       alpha=0.45, zorder=2, linewidth=0)
-            in_region = False
+    # ---- linhas de fronteira entre shots ----
+    for i in range(n_shots - 1):
+        ax.axvline(shot_ends[i], color=PALETTE['shot_edge'],
+                   linewidth=0.5, zorder=2, alpha=0.7)
 
-    # ---- ground truth (mean annotators, smoothed) ----
-    gt_plot = gt_mean[:n_frames]
-    ax.plot(x[:len(gt_plot)], gt_plot,
+    # ---- GT médio por shot (step centrado na posição do shot) ----
+    ax.step(shot_starts, shot_gt_scores,
             color=PALETTE['gt'], linewidth=1.4,
-            alpha=0.85, zorder=3, label='Ground truth (mean annotators)')
+            where='post', alpha=0.85, zorder=3,
+            label='Ground truth (mean, per shot)')
 
-    # ---- raw model scores ----
-    ax.plot(x, raw_scores,
-            color=PALETTE['raw'], linewidth=1.2,
-            alpha=0.9, zorder=4, label='Model scores (before knapsack)')
+    # ---- Score do modelo por shot (antes da mochila) ----
+    ax.step(shot_starts, shot_model_scores,
+            color=PALETTE['raw'], linewidth=1.4,
+            where='post', alpha=0.90, zorder=4,
+            label='Model score (normalised, per shot)')
 
-    # ---- knapsack binary mask (step) ----
-    ax.step(x, knapsack_mask.astype(np.float32),
-            color=PALETTE['knapsack'], linewidth=1.5,
-            where='post', zorder=5, alpha=0.9,
-            label='Knapsack selection (binary)')
+    # ---- Seleção binária do knapsack ----
+    ax.step(shot_starts, knapsack_selected,
+            color=PALETTE['knapsack'], linewidth=2.0,
+            where='post', alpha=0.95, zorder=5,
+            label='Knapsack selection (1 = selected)')
+
+    # ---- marcadores nos centros dos shots selecionados ----
+    sel_x = shot_centers[selected_indices]
+    sel_y = shot_model_scores[selected_indices]
+    ax.scatter(sel_x, sel_y,
+               color=PALETTE['knapsack'], s=28,
+               zorder=6, alpha=0.85)
 
     # ---- axes formatting ----
-    ax.set_xlim(0, n_frames - 1)
+    ax.set_xlim(0, total_frames)
     ax.set_ylim(-0.05, 1.15)
-    ax.set_xlabel('Frame index', fontsize=10, labelpad=6)
+    ax.set_xlabel('Frame position (shot boundaries)', fontsize=10, labelpad=6)
     ax.set_ylabel('Score / Selection', fontsize=10, labelpad=6)
 
-    # X-axis: show ~8 evenly spaced ticks
-    x_ticks = np.linspace(0, n_frames - 1, num=8, dtype=int)
-    ax.set_xticks(x_ticks)
-    ax.xaxis.set_major_formatter(ticker.FuncFormatter(
-        lambda val, _: f'{int(val):,}'
-    ))
+    # X-axis: ticks nos inícios de shots espaçados regularmente (~8 ticks)
+    step = max(1, n_shots // 8)
+    tick_positions = shot_starts[::step]
+    tick_labels    = [str(i * step) for i in range(len(tick_positions))]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels)
+    ax.xaxis.set_minor_locator(ticker.FixedLocator(shot_starts))
+    ax.tick_params(axis='x', which='minor', length=2,
+                   color=PALETTE['shot_edge'], alpha=0.6)
 
-    # Y-axis: 0.0, 0.25, 0.50, 0.75, 1.0
+    # Segunda linha no eixo X com número total de shots
+    ax.text(0.5, -0.13,
+            f'{n_shots} shots  ·  {total_frames:,} frames total',
+            transform=ax.transAxes, ha='center',
+            fontsize=8, color='#777777')
+
+    # Y-axis
     ax.set_yticks([0.0, 0.25, 0.50, 0.75, 1.0])
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
-
     ax.tick_params(axis='both', labelsize=8.5, length=3)
     ax.grid(axis='y', linestyle='--', linewidth=0.5, alpha=0.5, zorder=0)
     ax.spines[['top', 'right']].set_visible(False)
@@ -223,11 +263,11 @@ def plot_video(video_id, raw_scores, knapsack_mask, gt_mean,
     # ---- legend ----
     legend_handles = [
         plt.Line2D([0], [0], color=PALETTE['raw'],
-                   linewidth=1.5, label='Model scores (before knapsack)'),
+                   linewidth=1.5, label='Model score (normalised, per shot)'),
         plt.Line2D([0], [0], color=PALETTE['knapsack'],
-                   linewidth=1.5, label='Knapsack selection (binary)'),
+                   linewidth=2.0, label='Knapsack selection (1 = selected)'),
         plt.Line2D([0], [0], color=PALETTE['gt'],
-                   linewidth=1.5, label='Ground truth (mean annotators)'),
+                   linewidth=1.5, label='Ground truth (mean, per shot)'),
         Patch(facecolor=PALETTE['bg_select'], edgecolor='none',
               alpha=0.7, label='Selected region'),
     ]
@@ -244,10 +284,12 @@ def plot_video(video_id, raw_scores, knapsack_mask, gt_mean,
                  fontsize=10.5, fontweight='bold',
                  pad=8, loc='left')
 
-    # ---- annotation: % frames selected ----
-    pct = knapsack_mask.mean() * 100
+    # ---- annotation: n shots + % selecionados ----
+    pct_shots  = len(selected_indices) / n_shots * 100
+    pct_frames = sum(shot_lengths[i] for i in selected_indices) / total_frames * 100
     ax.text(0.995, 1.02,
-            f'Selected: {pct:.1f}% of frames',
+            f'Selected: {len(selected_indices)}/{n_shots} shots '
+            f'({pct_shots:.0f}%)  ·  {pct_frames:.1f}% of frames',
             transform=ax.transAxes,
             ha='right', va='bottom',
             fontsize=8, color='#555555')
@@ -258,12 +300,21 @@ def plot_video(video_id, raw_scores, knapsack_mask, gt_mean,
     safe_name  = _sanitise_filename(video_name if video_name else video_id)
     out_path   = os.path.join(out_folder, f'{safe_name}.png')
 
-    plt.tight_layout(pad=1.2)
+    plt.tight_layout(pad=1.4)
     plt.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
 
     return out_path
 
+def _min_max_normalize(scores, eps=1e-8):
+    scores = np.array(scores, dtype=float)
+    min_val = scores.min()
+    max_val = scores.max()
+
+    if max_val - min_val < eps:
+        return np.zeros_like(scores)
+
+    return (scores - min_val) / (max_val - min_val)
 
 # ---------------------------------------------------------------------------
 # Per-split driver
@@ -337,34 +388,46 @@ def plot_split(split_id, dataset, model_path, epoch_fname,
 
             # --- Model inference ---
             with torch.no_grad():
-                scores_tensor, _ = model(features)
-                scores = scores_tensor.squeeze(0).cpu().numpy().tolist()
+                scores, _, _, _ = model(features)
+                scores = scores.squeeze(0).cpu().numpy()
 
-            # --- Build three signals ---
-            raw_scores    = _upsample_scores(scores, positions, n_frames)
-            knapsack_mask, _ = _compute_knapsack_scores(raw_scores, shot_bound)
-            gt_mean       = _mean_gt(user_summary)
+            # ----------------------------------
+            # NORMALIZAÇÃO (igual à inferência)
+            # ----------------------------------
+            scores = _min_max_normalize(scores)
+
+            # manter compatibilidade
+            scores = scores.tolist()
+
+            # --- Build three signals at shot level ---
+            (shot_model_scores, knapsack_selected,
+             shot_gt_scores, shot_lengths,
+             selected_indices) = _compute_shot_signals(
+                scores, positions, n_frames, shot_bound, user_summary
+            )
 
             # --- Optional F1 for title ---
             from evaluation.evaluation_metrics import evaluate_summary
             from inference.generate_summary import generate_summary as _gs
             summary  = _gs([shot_bound], [scores], [n_frames], [positions])[0]
-            if(dataset == 'TVSum'):
-                f_score  = evaluate_summary(summary, user_summary, 'avg')
+            if dataset == 'TVSum':
+                f_score = evaluate_summary(summary, user_summary, 'avg')
             else:
-                f_score  = evaluate_summary(summary, user_summary, 'max')
+                f_score = evaluate_summary(summary, user_summary, 'max')
 
             # --- Plot ---
             out_path = plot_video(
-                video_id      = video_id,
-                raw_scores    = raw_scores,
-                knapsack_mask = knapsack_mask,
-                gt_mean       = gt_mean,
-                shot_bound    = shot_bound,
-                video_name    = video_name,
-                dataset       = dataset,
-                output_dir    = output_dir,
-                f_score       = f_score,
+                video_id          = video_id,
+                shot_model_scores = shot_model_scores,
+                knapsack_selected = knapsack_selected,
+                shot_gt_scores    = shot_gt_scores,
+                shot_lengths      = shot_lengths,
+                selected_indices  = selected_indices,
+                shot_bound        = shot_bound,
+                video_name        = video_name,
+                dataset           = dataset,
+                output_dir        = output_dir,
+                f_score           = f_score,
             )
             saved_paths.append(out_path)
 
