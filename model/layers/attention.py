@@ -26,7 +26,12 @@ class SEBlock(nn.Module):
 class sLSTM(nn.Module):
     def __init__(self, input_size=1024, hidden_dim=512, conv_channels=128, dropout=0.5, num_groups=16):
         super(sLSTM, self).__init__()
-        self.conv = nn.Conv1d(input_size, conv_channels, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(input_size, conv_channels, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(input_size, conv_channels, kernel_size=5, padding=2)
+        self.conv7 = nn.Conv1d(input_size, conv_channels, kernel_size=7, padding=3)
+
+        self.conv_fusion = nn.Conv1d(conv_channels * 3, conv_channels, kernel_size=1)
+        
         self.ln = nn.LayerNorm(conv_channels)
         self.lstm = nn.LSTM(conv_channels, hidden_dim, num_layers=1, batch_first=True, dropout=dropout)
         self.gn = nn.GroupNorm(num_groups, hidden_dim)
@@ -49,8 +54,16 @@ class sLSTM(nn.Module):
             x = x.unsqueeze(1)
         
         x = x.permute(0, 2, 1)
-        x = self.conv(x)
+
+        c3 = self.conv3(x)
+        c5 = self.conv5(x)
+        c7 = self.conv7(x)
+        
+        x = torch.cat([c3, c5, c7], dim=1)
+        x = self.conv_fusion(x)
+        
         x = x.permute(0, 2, 1)
+        
         x = self.ln(x)
         
         out, _ = self.lstm(x)
