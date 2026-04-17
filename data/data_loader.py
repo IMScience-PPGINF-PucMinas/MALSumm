@@ -1,123 +1,136 @@
+# -*- coding: utf-8 -*-
+"""data_loader_cv.py — CV-aware version of data_loader.py.
+
+Differences vs. the original:
+  - VideoDataCV receives an explicit `keys` list instead of reading
+    train/test keys from a split JSON by index.  The KFold partition
+    is built once in main_cv.py and passed here directly.
+  - Everything else is preserved: same HDF5 fields (features, gtscore),
+    same __getitem__ contract (train -> features+gtscore,
+    test -> features+video_name), same get_loader behaviour
+    (DataLoader for train, raw Dataset for test).
+  - 'both' mode is also supported.
+"""
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 import h5py
 import numpy as np
-import json
-from configs.constants import *
+
+from configs.constants import (
+    SUMME_DATASET_PATH,
+    TVSUM_DATASET_PATH,
+    MRHISUM_DATASET_PATH,
+)
 
 
-class VideoData(Dataset):
-    def __init__(self, mode, video_type, split_index):
-        """ Custom Dataset class wrapper for loading the frame features and ground truth importance scores.
+class VideoDataCV(Dataset):
+    def __init__(self, mode: str, video_type: str, keys: list):
+        """CV-aware Dataset: loads features and gtscores for an explicit key list.
 
-        :param str mode: The mode of the model, train or test.
-        :param str video_type: The Dataset being used, SumMe or TVSum.
-        :param int split_index: The index of the Dataset split being used.
+        Args:
+            mode       (str):  'train' or 'test'.
+            video_type (str):  'SumMe', 'TVSum', 'MrHiSum', or 'both'.
+            keys       (list): Video identifiers for this fold partition.
+                               Built by KFold in main_cv.py — not read
+                               from a split JSON here.
         """
         self.mode = mode
         self.name = video_type.lower()
-        self.datasets = [SUMME_DATASET_PATH,
-                         TVSUM_DATASET_PATH,
-                         MRHISUM_DATASET_PATH]
-        self.splits_filename = 'data/splits/' + self.name + '_splits.json'
-        self.split_index = split_index
+        self.keys = keys
+
+        self.list_frame_features = []
+        self.list_gtscores       = []
 
         if self.name == 'both':
-            self.splits_filenames = {
-                'summe': SUMME_SPLIT_FILE_PATH,
-                'tvsum': TVSUM_SPLIT_FILE_PATH
-            }
-            video_types = ['summe', 'tvsum']
-            self.list_frame_features, self.list_gtscores = [], []
-
-            for video_type in video_types:
-                filename = self.datasets[video_type]
-                splits_filename = self.splits_filenames[video_type]
-                with open(splits_filename) as f:
-                    data = json.loads(f.read())
-                    for i, split in enumerate(data):
-                        if i == self.split_index:
-                            self.split = split
-                            break
-
-                    #split = data[self.split_index]
-                    for video_name in self.split[self.mode + '_keys']:
-                        with h5py.File(filename, 'r') as hdf:
-                            frame_features = torch.Tensor(np.array(hdf[video_name + '/features']))
-                            gtscore = torch.Tensor(np.array(hdf[video_name + '/gtscore']))
-                            print(f"Loaded video {video_name}: frame_features shape {frame_features.shape}, gtscore shape {gtscore.shape}")
-                            self.list_frame_features.append(frame_features)
-                            self.list_gtscores.append(gtscore)
-
+            self._load_both()
         else:
-            if self.name == 'summe':
-                self.filename = self.datasets[0]
-            elif self.name == 'tvsum':
-                self.filename = self.datasets[1]
-            elif self.name == 'mrhisum':
-                self.filename = self.datasets[2]
-            hdf = h5py.File(self.filename, 'r')
-            self.list_frame_features, self.list_gtscores = [], []
+            self._load(self._resolve_path())
 
-            if self.name == 'mrhisum':
-                with open(self.splits_filename) as f:
-                    self.split = json.load(f)
-            else:
-                with open(self.splits_filename) as f:
-                    data = json.loads(f.read())
-                    for i, split in enumerate(data):
-                        if i == self.split_index:
-                            self.split = split
-                            break
+    # ------------------------------------------------------------------
+    # Path resolution
+    # ------------------------------------------------------------------
 
-            for video_name in self.split[self.mode + '_keys']:
-                frame_features = torch.Tensor(np.array(hdf[video_name + '/features']))
-                gtscore = torch.Tensor(np.array(hdf[video_name + '/gtscore']))
+    def _resolve_path(self) -> str:
+        mapping = {
+            'summe':   SUMME_DATASET_PATH,
+            'tvsum':   TVSUM_DATASET_PATH,
+            'mrhisum': MRHISUM_DATASET_PATH,
+        }
+        if self.name not in mapping:
+            raise ValueError(f"Unsupported video_type: '{self.name}'")
+        return mapping[self.name]
 
-                self.list_frame_features.append(frame_features)
-                self.list_gtscores.append(gtscore)
+    # ------------------------------------------------------------------
+    # Loading  — mirrors original VideoData.__init__ field names exactly
+    # ------------------------------------------------------------------
 
-        hdf.close()
+    def _load(self, filename: str):
+        """Load features and gtscores for self.keys from a single HDF5 file."""
+        with h5py.File(filename, 'r') as hdf:
+            for video_name in self.keys:
+                self.list_frame_features.append(
+                    torch.Tensor(np.array(hdf[f"{video_name}/features"]))
+                )
+                self.list_gtscores.append(
+                    torch.Tensor(np.array(hdf[f"{video_name}/gtscore"]))
+                )
+
+    def _load_both(self):
+        """Load from SumMe + TVSum for keys that belong to each file."""
+        for path in (SUMME_DATASET_PATH, TVSUM_DATASET_PATH):
+            with h5py.File(path, 'r') as hdf:
+                for video_name in self.keys:
+                    if video_name not in hdf:
+                        continue          # key lives in the other file
+                    self.list_frame_features.append(
+                        torch.Tensor(np.array(hdf[f"{video_name}/features"]))
+                    )
+                    self.list_gtscores.append(
+                        torch.Tensor(np.array(hdf[f"{video_name}/gtscore"]))
+                    )
+
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
 
     def __len__(self):
-        """ Function to be called for the `len` operator of `VideoData` Dataset. """
-        self.len = len(self.split[self.mode + '_keys'])
-        if self.name == 'mrhisum':
-            return len(self.split[f'{self.mode}_keys'])
-        else:
-            return self.len
+        return len(self.keys)
 
     def __getitem__(self, index):
-        """ Function to be called for the index operator of `VideoData` Dataset.
-        train mode returns: frame_features and gtscores
-        test mode returns: frame_features and video name
-
-        :param int index: The above-mentioned id of the data.
-        """
-        video_name = self.split[self.mode + '_keys'][index]
+        """Train -> (frame_features, gtscore).  Test -> (frame_features, video_name)."""
         frame_features = self.list_frame_features[index]
-        gtscore = self.list_gtscores[index]
+        gtscore        = self.list_gtscores[index]
 
         if self.mode == 'test':
-            return frame_features, video_name
-        else:
-            return frame_features, gtscore
+            return frame_features, self.keys[index]
+        return frame_features, gtscore
 
 
-def get_loader(mode, video_type, split_index):
-    """ Loads the `data.Dataset` of the `split_index` split for the `video_type` Dataset.
-    Wrapped by a Dataloader, shuffled and `batch_size` = 1 in train `mode`.
+# ---------------------------------------------------------------------------
+# Public factory  (same contract as original get_loader, minus split_index)
+# ---------------------------------------------------------------------------
 
-    :param str mode: The mode of the model, train or test.
-    :param str video_type: The Dataset being used, SumMe or TVSum.
-    :param int split_index: The index of the Dataset split being used.
-    :return: The Dataset used in each mode.
+def get_loader_cv(mode: str, video_type: str, keys: list):
+    """Build a loader for an explicit list of video keys (one CV fold).
+
+    Mirrors the original get_loader() behaviour exactly:
+      - train -> DataLoader(dataset, batch_size=1, shuffle=True)
+      - test  -> raw VideoDataCV  (Solver.evaluate iterates it directly)
+
+    Args:
+        mode       (str):  'train' or 'test'.
+        video_type (str):  'SumMe', 'TVSum', 'MrHiSum', or 'both'.
+        keys       (list): Video keys for this fold partition.
+
+    Returns:
+        DataLoader (train) or VideoDataCV (test).
     """
+    dataset = VideoDataCV(mode, video_type, keys)
+
     if mode.lower() == 'train':
-        vd = VideoData(mode, video_type, split_index)
-        return DataLoader(vd, batch_size=1, shuffle=True)
-    else:
-        return VideoData(mode, video_type, split_index)
+        return DataLoader(dataset, batch_size=1, shuffle=True)
+    return dataset      # same contract as original get_loader test path
 
 
 if __name__ == '__main__':
