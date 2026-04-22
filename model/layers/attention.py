@@ -48,7 +48,10 @@ class sLSTM(nn.Module):
         self.proj = nn.Linear(hidden_dim, input_size)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(input_size, input_size)
-        
+        self.res_proj = nn.Sequential(
+            nn.Linear(conv_channels, hidden_dim),
+            nn.GELU()
+        )        
     def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(1)
@@ -66,8 +69,10 @@ class sLSTM(nn.Module):
         
         x = self.ln(x)
         
+        res = self.res_proj(x)   # (B, T, 128) → (B, T, 512)
         out, _ = self.lstm(x)
-        
+        out = out + res
+
         out = out.permute(0, 2, 1)
         out = self.gn(out)
         out = out.permute(0, 2, 1)
