@@ -19,6 +19,12 @@ class xLSTM(nn.Module):
         self.fc_output = nn.Linear(output_size, 1)
         self.num_segments = num_segments
 
+    def count_parameters(self):
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Total parameters: {total:,}")
+        print(f"Trainable parameters: {trainable:,}")
+
     def forward(self, x):
         x_slstm = self.slstm(x)
         x_mlstm, attn_weights = self.mlstm(x_slstm)
