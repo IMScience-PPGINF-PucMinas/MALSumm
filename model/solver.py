@@ -47,6 +47,8 @@ class Solver:
             dropout=self.config.dropout
         ).to(self.config.device)
 
+        self.model.count_parameters()
+
         if self.config.init_type is not None:
             self.init_weights(self.model, init_type=self.config.init_type, init_gain=self.config.init_gain)
 
